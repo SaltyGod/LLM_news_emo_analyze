@@ -44,26 +44,42 @@ def get_embeddings(prompts, tokenizer, model):
 
     return sentence_embeddings
 
-def calculate_cosine_similarity(embeddings):
+def calculate_cosine_similarity(embedding_1, embeddings):
     """
-    计算两个嵌入的余弦相似度。
+    计算一个嵌入与其他多个嵌入的余弦相似度。
 
     参数:
-    embeddings (torch.Tensor): 嵌入表示的张量。
-    
+    embedding_1 (torch.Tensor): 第一个嵌入表示。
+    embeddings (torch.Tensor): 其他嵌入表示的张量。
+
     返回:
-    float: 两个嵌入的余弦相似度。
+    torch.Tensor: 相似度列表。
     """
-    cosine_similarity = F.cosine_similarity(embeddings[0].unsqueeze(0), embeddings[1].unsqueeze(0))
-    return cosine_similarity.item()
+    cosine_similarities = F.cosine_similarity(embedding_1.unsqueeze(0), embeddings)
+    return cosine_similarities
 
 if __name__ == "__main__":
     prompt_1 = "这是第一个自定义的提示"
-    prompt_2 = "这是第二个自定义的提示"
-    model_path = '/root/.cache/LLMS/hub/BAAI/bge-large-zh-v1___5' # BG-large-zh-v1.5模型
-    
+    other_prompts = [
+        "这是第二个自定义的提示",
+        "这是第三个自定义的提示",
+        "这是第四个自定义的提示",
+        "这是第五个自定义的提示"
+    ]
+    model_path = '/root/.cache/LLMS/hub/BAAI/bge-large-zh-v1___5'  # BGE-large-zh-v1.5模型
     tokenizer, model = load_model(model_path)
-    embeddings = get_embeddings([prompt_1, prompt_2], tokenizer, model)
-    
-    similarity = calculate_cosine_similarity(embeddings)
-    print("余弦相似度:", similarity)
+
+    # 获取所有提示的嵌入
+    all_prompts = [prompt_1] + other_prompts
+    embeddings = get_embeddings(all_prompts, tokenizer, model)
+
+    # 计算prompt_1与其他提示的相似度
+    similarity_scores = calculate_cosine_similarity(embeddings[0], embeddings[1:])
+
+    # 找出相似度最高的提示及其相似度值
+    max_similarity_index = torch.argmax(similarity_scores).item()
+    max_similarity_score = similarity_scores[max_similarity_index].item()
+    most_similar_prompt = other_prompts[max_similarity_index]
+
+    print("与prompt_1最相似的提示是:", most_similar_prompt)
+    print("相似度值:", max_similarity_score)
