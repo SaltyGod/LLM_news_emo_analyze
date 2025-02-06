@@ -224,13 +224,13 @@ if __name__ == "__main__":
     model_path = '/root/.cache/LLMS/hub/BAAI/bge-large-zh-v1___5'
     
     # 新闻文本文件路径
-    news_file_path = '/root/LLM_news_emo_analyze/DATA/news_test_data.xlsx'
+    news_file_path = './DATA/news_test_data.xlsx'
     
     # 主题提示文件路径
-    lda_key_words_path = '/root/LLM_news_emo_analyze/DATA/lda_key_words.xlsx'
+    lda_key_words_path = './DATA/lda_key_words.xlsx'
     
     # 输出文件路径
-    output_file_path = '/root/LLM_news_emo_analyze/DATA/news_data_with_topics.xlsx'
+    output_file_path = './output_result/DATA/news_data_with_topics.xlsx'
     
     # 调用主处理函数
     process_news_data(news_file_path, lda_key_words_path, model_path, output_file_path)
