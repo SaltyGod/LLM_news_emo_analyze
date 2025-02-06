@@ -223,6 +223,7 @@ if __name__ == "__main__":
     # 模型路径
     model_path = '/root/.cache/LLMS/hub/BAAI/bge-large-zh-v1___5'
     
+    
     # 新闻文本文件路径
     news_file_path = './DATA/news_test_data.xlsx'
     
