@@ -3,6 +3,7 @@ import torch
 import re
 import torch.nn.functional as F
 import pandas as pd
+import json
 
 def load_model(model_path):
     """
@@ -174,9 +175,9 @@ def process_news_data(news_file_path, lda_key_words_path, model_path, output_fil
                     continue
                 
                 # 存储分隔后的句子
-                sentence_dict = {f"news_prompt{i+1}": f"\"{sentence}\"" 
+                sentence_dict = {f"news_prompt{i+1}": sentence 
                                for i, sentence in enumerate(sentences)}
-                df.at[index, 'NewsContent_cut'] = str(sentence_dict)
+                df.at[index, 'NewsContent_cut'] = json.dumps(sentence_dict, ensure_ascii=False)
                 
                 # 存储每个句子的主题匹配结果
                 topic_match_dict = {}
@@ -197,14 +198,15 @@ def process_news_data(news_file_path, lda_key_words_path, model_path, output_fil
                         most_similar_topic = key_topic_list[max_similarity_index]
                         theme_category = extract_theme_category(most_similar_topic)
                         
-                        topic_match_dict[f"\"{sentence}\""] = {
+                        topic_match_dict[sentence] = {
                             "topic": theme_category,
                             "similarity": similarity_score
                         }
-                        print(topic_match_dict)
                 
-                # 存储到新的列
-                df.at[index, 'cut_news_topic_match'] = str(topic_match_dict)
+                # 使用json.dumps确保输出格式正确
+                df.at[index, 'cut_news_topic_match'] = json.dumps(topic_match_dict, 
+                                                                 ensure_ascii=False, 
+                                                                 indent=None)
                 print(f"成功处理第 {index} 行")
                 
             except Exception as e:
@@ -230,7 +232,7 @@ if __name__ == "__main__":
     lda_key_words_path = './DATA/lda_key_words.xlsx'
     
     # 输出文件路径
-    output_file_path = './output_result/DATA/news_data_with_topics.xlsx'
+    output_file_path = './output_result/news_data_with_topics.xlsx'
     
     # 调用主处理函数
     process_news_data(news_file_path, lda_key_words_path, model_path, output_file_path)
