@@ -9,6 +9,8 @@ import numpy as np
 from tqdm import tqdm
 import time
 from modelscope import AutoModelForSequenceClassification, AutoTokenizer as MSTokenizer
+from functools import lru_cache
+from retry import retry
 
 def load_model(model_path):
     """
@@ -97,7 +99,7 @@ def get_theme_prompts(lda_key_words_path):
             # 过滤掉NaN值并转换为列表
             keywords = [str(k) for k in row.iloc[1:].dropna().tolist()]
             if keywords:
-                prompt = f"新闻的主题是“{theme_category}”，关键词是“{'、'.join(keywords)}”"
+                prompt = f"新闻的主题是“{theme_category}”，关键词是“{''.join(keywords)}”"
                 prompts.append(prompt)
         
         if not prompts:
@@ -163,11 +165,7 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
     # 构造新闻句子的prompt
     sentence_prompt = f"新闻内容是“{sentence}”"
     
-    # 获取所有情感词的完整prompt
-    sentiment_word_prompts = [f"新闻文本包含的单词是“{word}”" for word in original_words]
-    
-    # 第一阶段：FAISS快速筛选
-    sentiment_embeddings = get_embeddings(sentiment_word_prompts, bge_tokenizer, bge_model)
+    # 第一阶段：FAISS快速筛选（直接使用已构建的索引）
     sentence_embedding = get_embeddings([sentence_prompt], bge_tokenizer, bge_model)
     D, I = faiss_index.search(sentence_embedding.numpy(), top_k)
     
@@ -208,11 +206,64 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
     sorted_results = sorted(reranker_results, key=lambda x: x['reranker_score'], reverse=True)
     return sorted_results[:2]
 
-def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, model_path, 
-                     reranker_path, output_file_path, similarity_threshold=0.37):
+@lru_cache(maxsize=1024)
+def get_cached_embeddings(text, tokenizer, model, is_batch=False):
     """
-    处理新闻数据，使用两阶段方案进行情感词匹配
+    带缓存的向量计算
     """
+    if is_batch:
+        return get_embeddings(text, tokenizer, model)
+    return get_embeddings([text], tokenizer, model)
+
+def batch_get_embeddings(texts, tokenizer, model, batch_size=32):
+    """
+    批量计算向量
+    """
+    embeddings_list = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        batch_embeddings = get_embeddings(batch_texts, tokenizer, model)
+        embeddings_list.append(batch_embeddings)
+    return torch.cat(embeddings_list, dim=0)
+
+@retry(tries=3, delay=1, backoff=2)
+def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_words, 
+                          sentiment_scores, reranker_model, reranker_tokenizer, 
+                          bge_tokenizer, bge_model, key_topic_embeddings, 
+                          key_topic_list, similarity_threshold):
+    """
+    处理单个句子，带重试机制
+    """
+    # 主题匹配
+    sentence_embedding = get_cached_embeddings(sentence, bge_tokenizer, bge_model)
+    topic_similarity_scores = calculate_cosine_similarity(sentence_embedding, key_topic_embeddings)
+    max_topic_idx = torch.argmax(topic_similarity_scores).item()
+    topic_similarity = topic_similarity_scores[max_topic_idx].item()
+    
+    if topic_similarity <= similarity_threshold:
+        return None
+    
+    result_dict = {
+        "topic": extract_theme_category(key_topic_list[max_topic_idx]),
+        "similarity": topic_similarity,
+    }
+    
+    # 情感词匹配
+    sentiment_matches = hybrid_sentiment_search(
+        sentence, faiss_index, sentiment_prompts, original_words, sentiment_scores,
+        reranker_model, reranker_tokenizer, bge_tokenizer, bge_model
+    )
+    
+    if sentiment_matches:
+        sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是"
+        sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
+        result_dict["prompt"] = sentiment_prompt
+    
+    return result_dict
+
+def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, 
+                     model_path, reranker_path, output_file_path, 
+                     similarity_threshold=0.37, batch_size=32):
     try:
         # 加载BGE-large模型
         bge_tokenizer, bge_model = load_model(model_path)
@@ -225,29 +276,33 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, m
         sentiment_prompts, original_words, sentiment_scores = load_sentiment_words(sentiment_dict_path)
         print(f"成功加载 {len(sentiment_prompts)} 个情感词")
         
-        # 构建FAISS索引
-        print("开始计算情感词嵌入向量...")
-        sentiment_embeddings = get_embeddings(sentiment_prompts, bge_tokenizer, bge_model)
+        # 批量计算情感词向量
+        print("批量计算情感词向量...")
+        sentiment_word_prompts = [f"新闻文本包含的单词是“{word}”" for word in original_words]
+        sentiment_embeddings = batch_get_embeddings(sentiment_word_prompts, bge_tokenizer, bge_model, batch_size)
         sentiment_embeddings_np = sentiment_embeddings.numpy()
+        
+        # 构建FAISS索引
+        print("开始构建FAISS索引...")
         faiss_index = build_faiss_index(sentiment_embeddings_np)
         print("FAISS索引构建完成")
-        
-        # 处理新闻数据
-        df = pd.read_excel(news_file_path, nrows=10)
-        if df.empty:
-            raise ValueError("新闻文件为空")
         
         # 获取主题提示和嵌入
         key_topic_list = get_theme_prompts(lda_key_words_path)
         key_topic_embeddings = get_embeddings(key_topic_list, bge_tokenizer, bge_model)
         print(f"成功加载 {len(key_topic_list)} 个主题提示")
         
+        # 处理新闻数据
+        df = pd.read_excel(news_file_path, nrows=10)
+        if df.empty:
+            raise ValueError("新闻文件为空")
+        
         # 遍历处理每一行
         for index, row in tqdm(df.iterrows(), desc="处理新闻"):
             try:
                 if pd.isna(row['NewsContent']):
                     continue
-                    
+                
                 news_content = str(row['NewsContent'])
                 sentences = split_sentences(news_content)
                 
@@ -261,34 +316,22 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, m
                 
                 # 存储每个句子的主题匹配和情感词匹配结果
                 topic_match_dict = {}
-                for sentence in sentences:
-                    # 主题匹配
-                    sentence_embedding = get_embeddings([sentence], bge_tokenizer, bge_model)
-                    topic_similarity_scores = calculate_cosine_similarity(sentence_embedding, key_topic_embeddings)
-                    max_topic_idx = torch.argmax(topic_similarity_scores).item()
-                    topic_similarity = topic_similarity_scores[max_topic_idx].item()
-                    
-                    # 只有当主题相似度超过阈值时才进行情感词匹配
-                    if topic_similarity > similarity_threshold:
-                        result_dict = {
-                            "topic": extract_theme_category(key_topic_list[max_topic_idx]),
-                            "similarity": topic_similarity,
-                        }
-                        
-                        # 两阶段情感词匹配
-                        sentiment_matches = hybrid_sentiment_search(
-                            sentence, faiss_index, sentiment_prompts, original_words, sentiment_scores,
-                            reranker_model, reranker_tokenizer, bge_tokenizer, bge_model
-                        )
-                        
-                        if sentiment_matches:
-                            sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是"
-                            sentiment_prompt += "，".join([f"{m['word']}：{m['score']}" for m in sentiment_matches])
-                            result_dict["prompt"] = sentiment_prompt
-                        
-                        topic_match_dict[sentence] = result_dict
                 
-                # 只有当有匹配结果时才保存
+                # 添加句子处理进度条
+                for sentence in tqdm(sentences, desc=f"处理第 {index} 行的句子", leave=False):
+                    try:
+                        result = process_single_sentence(
+                            sentence, faiss_index, sentiment_prompts, original_words, 
+                            sentiment_scores, reranker_model, reranker_tokenizer,
+                            bge_tokenizer, bge_model, key_topic_embeddings, 
+                            key_topic_list, similarity_threshold
+                        )
+                        if result:
+                            topic_match_dict[sentence] = result
+                    except Exception as e:
+                        print(f"处理句子失败 (3次重试后): {str(e)}")
+                        continue
+                
                 if topic_match_dict:
                     df.at[index, 'cut_news_topic_match'] = json.dumps(topic_match_dict, ensure_ascii=False)
                     print(f"第 {index} 行处理结果:", topic_match_dict)
