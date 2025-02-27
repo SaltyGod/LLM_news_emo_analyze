@@ -116,6 +116,18 @@ def split_sentences(text):
     sentences = re.split(r'[！。？；]', text)
     # 去掉空字符串
     sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+    
+    # 定义需要剔除的关键词
+    keywords_to_exclude = [
+        "文章来源", "建议关注", "买入评级", "风险提示", 
+        "增持评级", "不构成任何投资建议", 
+        "亦不代表平台观点", "请投资人独立判断和决策", 
+        "中报", "图片来源"
+    ]
+    
+    # 过滤掉包含特定内容的句子
+    sentences = [s for s in sentences if not any(keyword in s for keyword in keywords_to_exclude)]
+    
     return sentences
 
 def extract_theme_category(topic_text):
@@ -158,7 +170,7 @@ def compute_reranker_score(model, tokenizer, text1, text2):
 
 def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_words, sentiment_scores,
                           reranker_model, reranker_tokenizer, bge_tokenizer, bge_model, 
-                          first_stage_threshold=0.3, top_k=5):
+                          first_stage_threshold=0.36, top_k=8):
     """
     两阶段搜索：FAISS快速筛选 + Reranker精确排序
     """
@@ -187,7 +199,7 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
     reranker_results = []
     for candidate in candidates:
         # 构造文本对
-        pairs = [[sentence_prompt, f"新闻文本包含的单词是“{candidate['word']}”"]]
+        pairs = [[sentence_prompt, f"与新闻内容最相关的单词是“{candidate['word']}”"]]
         
         # 使用reranker计算分数
         with torch.no_grad():
@@ -255,15 +267,17 @@ def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_w
     )
     
     if sentiment_matches:
-        sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是"
+        sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是："
         sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
         result_dict["prompt"] = sentiment_prompt
+    else:
+        return None  # 如果没有情感匹配，直接返回 None
     
     return result_dict
 
 def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, 
                      model_path, reranker_path, output_file_path, 
-                     similarity_threshold=0.37, batch_size=32):
+                     similarity_threshold=0.42, batch_size=32):
     try:
         # 加载BGE-large模型
         bge_tokenizer, bge_model = load_model(model_path)
@@ -278,7 +292,7 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
         
         # 批量计算情感词向量
         print("批量计算情感词向量...")
-        sentiment_word_prompts = [f"新闻文本包含的单词是“{word}”" for word in original_words]
+        sentiment_word_prompts = [f"与新闻内容最相关的单词是“{word}”" for word in original_words]
         sentiment_embeddings = batch_get_embeddings(sentiment_word_prompts, bge_tokenizer, bge_model, batch_size)
         sentiment_embeddings_np = sentiment_embeddings.numpy()
         
@@ -293,7 +307,8 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
         print(f"成功加载 {len(key_topic_list)} 个主题提示")
         
         # 处理新闻数据
-        df = pd.read_excel(news_file_path, nrows=10)
+        df = pd.read_excel(news_file_path)
+        df = df.sample(100,random_state=42)
         if df.empty:
             raise ValueError("新闻文件为空")
         
@@ -326,7 +341,7 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
                             bge_tokenizer, bge_model, key_topic_embeddings, 
                             key_topic_list, similarity_threshold
                         )
-                        if result:
+                        if result:  # 只有在结果不为 None 时才加入
                             topic_match_dict[sentence] = result
                     except Exception as e:
                         print(f"处理句子失败 (3次重试后): {str(e)}")
@@ -367,7 +382,7 @@ def load_sentiment_words(sentiment_dict_path):
     with open(sentiment_dict_path, 'r', encoding='utf-8') as f:
         for line in f:
             word, score = line.strip().split('\t')
-            prompt = f"新闻文本包含的单词是{word}"
+            prompt = f"与新闻内容最相关的单词是“{word}”"
             prompts.append(prompt)
             original_words.append(word)
             scores.append(float(score))
@@ -397,8 +412,8 @@ def build_faiss_index(embeddings):
     
     dimension = embeddings.shape[1]
     
-    # 创建CPU索引
-    index = faiss.IndexFlatIP(dimension)
+    # 创建HNSW索引
+    index = faiss.IndexHNSWFlat(dimension, 32)  # 32是邻居数，可以根据需要调整
     
     # 如果有GPU，转换为GPU索引
     if faiss.get_num_gpus() > 0:
@@ -417,7 +432,7 @@ def build_faiss_index(embeddings):
         except Exception as e:
             print(f"GPU索引构建失败: {str(e)}")
             print("回退到CPU索引")
-            index = faiss.IndexFlatIP(dimension)
+            index = faiss.IndexHNSWFlat(dimension, 32)
             index.add(embeddings)
             end_time = time.time()
             print(f"CPU索引构建完成，耗时: {end_time - start_time:.2f}秒")
@@ -436,9 +451,9 @@ if __name__ == "__main__":
     
     # 文件路径
     news_file_path = './DATA/news_test_data.xlsx'
-    lda_key_words_path = './DATA/lda_key_words.xlsx'
-    sentiment_dict_path = './DATA/process_senti_dic_EN.txt'
-    output_file_path = './output_result/news_data_with_topics.xlsx'
+    lda_key_words_path = './DATA/lda_key_words2.xlsx'
+    sentiment_dict_path = './DATA/process_senti_dic_EN2.txt'
+    output_file_path = './output_result/news_data_with_topics_0225.xlsx'
     
     # 调用主处理函数
     process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, 
