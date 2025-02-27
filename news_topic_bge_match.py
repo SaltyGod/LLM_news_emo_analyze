@@ -116,18 +116,6 @@ def split_sentences(text):
     sentences = re.split(r'[！。？；]', text)
     # 去掉空字符串
     sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
-    
-    # 定义需要剔除的关键词
-    keywords_to_exclude = [
-        "文章来源", "建议关注", "买入评级", "风险提示", 
-        "增持评级", "不构成任何投资建议", 
-        "亦不代表平台观点", "请投资人独立判断和决策", 
-        "中报", "图片来源"
-    ]
-    
-    # 过滤掉包含特定内容的句子
-    sentences = [s for s in sentences if not any(keyword in s for keyword in keywords_to_exclude)]
-    
     return sentences
 
 def extract_theme_category(topic_text):
@@ -170,7 +158,7 @@ def compute_reranker_score(model, tokenizer, text1, text2):
 
 def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_words, sentiment_scores,
                           reranker_model, reranker_tokenizer, bge_tokenizer, bge_model, 
-                          first_stage_threshold=0.36, top_k=8):
+                          first_stage_threshold=0.4, top_k=10):
     """
     两阶段搜索：FAISS快速筛选 + Reranker精确排序
     """
@@ -270,8 +258,6 @@ def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_w
         sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是："
         sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
         result_dict["prompt"] = sentiment_prompt
-    else:
-        return None  # 如果没有情感匹配，直接返回 None
     
     return result_dict
 
@@ -341,7 +327,7 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
                             bge_tokenizer, bge_model, key_topic_embeddings, 
                             key_topic_list, similarity_threshold
                         )
-                        if result:  # 只有在结果不为 None 时才加入
+                        if result:
                             topic_match_dict[sentence] = result
                     except Exception as e:
                         print(f"处理句子失败 (3次重试后): {str(e)}")
@@ -412,8 +398,8 @@ def build_faiss_index(embeddings):
     
     dimension = embeddings.shape[1]
     
-    # 创建HNSW索引
-    index = faiss.IndexHNSWFlat(dimension, 32)  # 32是邻居数，可以根据需要调整
+    # 创建CPU索引
+    index = faiss.IndexFlatIP(dimension)
     
     # 如果有GPU，转换为GPU索引
     if faiss.get_num_gpus() > 0:
@@ -432,7 +418,7 @@ def build_faiss_index(embeddings):
         except Exception as e:
             print(f"GPU索引构建失败: {str(e)}")
             print("回退到CPU索引")
-            index = faiss.IndexHNSWFlat(dimension, 32)
+            index = faiss.IndexFlatIP(dimension)
             index.add(embeddings)
             end_time = time.time()
             print(f"CPU索引构建完成，耗时: {end_time - start_time:.2f}秒")
