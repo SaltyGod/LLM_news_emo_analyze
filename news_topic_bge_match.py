@@ -11,6 +11,10 @@ import time
 from modelscope import AutoModelForSequenceClassification, AutoTokenizer as MSTokenizer
 from functools import lru_cache
 from retry import retry
+import os
+from concurrent.futures import ProcessPoolExecutor
+import math
+import psutil
 
 def load_model(model_path):
     """
@@ -40,8 +44,13 @@ def get_embeddings(prompts, tokenizer, model):
     返回:
     torch.Tensor: 嵌入表示的张量。
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
     # Tokenize custom prompts
     encoded_input = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
+    # 将输入移到GPU
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
 
     # Compute token embeddings
     with torch.no_grad():
@@ -51,6 +60,9 @@ def get_embeddings(prompts, tokenizer, model):
 
     # Normalize embeddings
     sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+    
+    # 移回CPU
+    sentence_embeddings = sentence_embeddings.cpu()
 
     return sentence_embeddings
 
@@ -162,6 +174,8 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
     """
     两阶段搜索：FAISS快速筛选 + Reranker精确排序
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     # 构造新闻句子的prompt
     sentence_prompt = f"新闻内容是“{sentence}”"
     
@@ -193,6 +207,8 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
         with torch.no_grad():
             inputs = reranker_tokenizer(pairs, padding=True, truncation=True, 
                                       return_tensors='pt', max_length=512)
+            # 将输入移到GPU
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             scores = reranker_model(**inputs, return_dict=True).logits.view(-1,).float()
             reranker_score = scores[0].item()
         
@@ -206,25 +222,38 @@ def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_w
     sorted_results = sorted(reranker_results, key=lambda x: x['reranker_score'], reverse=True)
     return sorted_results[:2]
 
-@lru_cache(maxsize=1024)
-def get_cached_embeddings(text, tokenizer, model, is_batch=False):
-    """
-    带缓存的向量计算
-    """
-    if is_batch:
-        return get_embeddings(text, tokenizer, model)
-    return get_embeddings([text], tokenizer, model)
-
 def batch_get_embeddings(texts, tokenizer, model, batch_size=32):
     """
-    批量计算向量
+    批量计算向量，使用GPU加速
     """
     embeddings_list = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
-        batch_embeddings = get_embeddings(batch_texts, tokenizer, model)
-        embeddings_list.append(batch_embeddings)
+        encoded_input = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt')
+        # 将输入移到GPU
+        encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+        
+        with torch.no_grad():
+            model_output = model(**encoded_input)
+            sentence_embeddings = model_output[0][:, 0]
+            # 标准化
+            sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+            # 移回CPU
+            embeddings_list.append(sentence_embeddings.cpu())
+            
     return torch.cat(embeddings_list, dim=0)
+
+@lru_cache(maxsize=2048)  # 增加缓存大小
+def get_cached_embeddings(text, tokenizer, model, is_batch=False):
+    """
+    带缓存的向量计算，增加缓存大小
+    """
+    if is_batch:
+        return batch_get_embeddings(text, tokenizer, model)
+    return batch_get_embeddings([text], tokenizer, model)
 
 def is_valid_sentence(sentence):
     """
@@ -308,9 +337,12 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
     try:
         # 加载BGE-large模型
         bge_tokenizer, bge_model = load_model(model_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bge_model = bge_model.to(device)
         
         # 加载reranker模型
         reranker_tokenizer, reranker_model = load_reranker(reranker_path)
+        reranker_model = reranker_model.to(device)
         print("成功加载Reranker模型")
         
         # 加载情感词典
@@ -334,54 +366,100 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
         print(f"成功加载 {len(key_topic_list)} 个主题提示")
         
         # 处理新闻数据
+        print("开始读取新闻数据...")
         df = pd.read_excel(news_file_path)
         df = df.sample(100,random_state=42)
         if df.empty:
             raise ValueError("新闻文件为空")
+        print(f"共读取 {len(df)} 条新闻数据")
         
-        # 遍历处理每一行
-        for index, row in tqdm(df.iterrows(), desc="处理新闻"):
-            try:
-                if pd.isna(row['NewsContent']):
-                    continue
-                
-                news_content = str(row['NewsContent'])
-                sentences = split_sentences(news_content)
-                
-                if not sentences:
-                    continue
-                
-                # 存储有效的句子和处理结果
-                valid_sentences = {}
-                topic_match_dict = {}
-                
-                # 添加句子处理进度条
-                for i, sentence in enumerate(tqdm(sentences, desc=f"处理第 {index} 行的句子", leave=False)):
-                    try:
-                        result = process_single_sentence(
-                            sentence, faiss_index, sentiment_prompts, original_words, 
-                            sentiment_scores, reranker_model, reranker_tokenizer,
-                            bge_tokenizer, bge_model, key_topic_embeddings, 
-                            key_topic_list, similarity_threshold
-                        )
-                        if result:
-                            valid_sentences[f"news_prompt{i+1}"] = sentence
-                            topic_match_dict[sentence] = result
-                    except Exception as e:
-                        print(f"处理句子失败 (3次重试后): {str(e)}")
+        # 使用单进程批处理
+        results = []
+        
+        # 创建总进度条
+        with tqdm(total=len(df), desc="处理新闻进度") as pbar:
+            for index, row in df.iterrows():
+                try:
+                    if pd.isna(row['NewsContent']):
+                        pbar.update(1)
                         continue
-                
-                # 只有当有有效结果时才更新DataFrame
-                if valid_sentences and topic_match_dict:
-                    df.at[index, 'NewsContent_cut'] = json.dumps(valid_sentences, ensure_ascii=False)
-                    df.at[index, 'cut_news_topic_match'] = json.dumps(topic_match_dict, ensure_ascii=False)
-                    print(f"第 {index} 行处理结果:", topic_match_dict)
-                
-            except Exception as e:
-                print(f"处理第 {index} 行时出错: {str(e)}")
-                continue
+                    
+                    news_content = str(row['NewsContent'])
+                    sentences = split_sentences(news_content)
+                    
+                    if not sentences:
+                        pbar.update(1)
+                        continue
+                    
+                    valid_sentences = {}
+                    topic_match_dict = {}
+                    
+                    # 批量处理句子，提高GPU利用率
+                    valid_sentences_batch = []
+                    for i in range(0, len(sentences), batch_size):
+                        batch = sentences[i:i + batch_size]
+                        batch_results = []
+                        
+                        # 批量获取句子嵌入
+                        batch_embeddings = get_embeddings([f"新闻内容是"{s}"" for s in batch], 
+                                                        bge_tokenizer, bge_model)
+                        
+                        for j, sentence in enumerate(batch):
+                            if not is_valid_sentence(sentence):
+                                continue
+                                
+                            try:
+                                result = process_single_sentence(
+                                    sentence, faiss_index, sentiment_prompts, 
+                                    original_words, sentiment_scores,
+                                    reranker_model, reranker_tokenizer,
+                                    bge_tokenizer, bge_model, key_topic_embeddings,
+                                    key_topic_list, similarity_threshold
+                                )
+                                
+                                if result:
+                                    valid_sentences[f"news_prompt{len(valid_sentences)+1}"] = sentence
+                                    topic_match_dict[sentence] = result
+                                    
+                            except Exception as e:
+                                print(f"\n处理句子出错: {str(e)}")
+                                continue
+                        
+                        # 清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    if valid_sentences and topic_match_dict:
+                        results.append({
+                            'index': index,
+                            'NewsContent_cut': json.dumps(valid_sentences, ensure_ascii=False),
+                            'cut_news_topic_match': json.dumps(topic_match_dict, ensure_ascii=False)
+                        })
+                    
+                    pbar.update(1)
+                    
+                    # 定期监控内存使用
+                    if index % 10 == 0:
+                        monitor_memory()
+                        
+                except Exception as e:
+                    print(f"\n处理第 {index} 行时出错: {str(e)}")
+                    pbar.update(1)
+                    continue
+        
+        print(f"\n处理完成，共处理 {len(results)} 条有效数据")
+        
+        # 更新DataFrame
+        print("\n开始更新数据...")
+        with tqdm(total=len(results), desc="更新进度") as pbar:
+            for result in results:
+                idx = result['index']
+                df.at[idx, 'NewsContent_cut'] = result['NewsContent_cut']
+                df.at[idx, 'cut_news_topic_match'] = result['cut_news_topic_match']
+                pbar.update(1)
         
         # 保存结果
+        print("\n开始保存结果...")
         df.to_excel(output_file_path, index=False)
         print(f"处理完成，结果已保存到 {output_file_path}")
         
@@ -469,6 +547,23 @@ def build_faiss_index(embeddings):
         end_time = time.time()
         print(f"索引构建完成，耗时: {end_time - start_time:.2f}秒")
         return index
+
+# 添加内存管理函数
+def clear_gpu_memory():
+    """
+    清理GPU内存
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+def monitor_memory():
+    """
+    监控内存使用情况
+    """
+    process = psutil.Process()
+    print(f"内存使用: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    if torch.cuda.is_available():
+        print(f"GPU内存使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
 if __name__ == "__main__":
     # 模型路径
