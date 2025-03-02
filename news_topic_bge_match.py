@@ -226,6 +226,34 @@ def batch_get_embeddings(texts, tokenizer, model, batch_size=32):
         embeddings_list.append(batch_embeddings)
     return torch.cat(embeddings_list, dim=0)
 
+def is_valid_sentence(sentence):
+    """
+    检查句子是否有效
+    
+    参数:
+    sentence (str): 待检查的句子
+    
+    返回:
+    bool: 是否为有效句子
+    """
+    # 无效的关键词列表
+    invalid_keywords = [
+        "文章来源", "建议关注", "买入评级", "风险提示", "增持评级",
+        "不构成任何投资建议", "亦不代表平台观点", "请投资人独立判断和决策",
+        "中报", "图片来源"
+    ]
+    
+    # 检查句子长度
+    if len(sentence.strip()) < 5:
+        return False
+        
+    # 检查是否包含无效关键词
+    for keyword in invalid_keywords:
+        if keyword in sentence:
+            return False
+            
+    return True
+
 @retry(tries=3, delay=1, backoff=2)
 def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_words, 
                           sentiment_scores, reranker_model, reranker_tokenizer, 
@@ -233,20 +261,13 @@ def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_w
                           key_topic_list, similarity_threshold):
     """
     处理单个句子，带重试机制
+    
+    返回:
+    dict/None: 如果句子有效且匹配成功返回结果字典，否则返回None
     """
-    # 主题匹配
-    sentence_embedding = get_cached_embeddings(sentence, bge_tokenizer, bge_model)
-    topic_similarity_scores = calculate_cosine_similarity(sentence_embedding, key_topic_embeddings)
-    max_topic_idx = torch.argmax(topic_similarity_scores).item()
-    topic_similarity = topic_similarity_scores[max_topic_idx].item()
-    
-    if topic_similarity <= similarity_threshold:
+    # 首先检查句子是否有效
+    if not is_valid_sentence(sentence):
         return None
-    
-    result_dict = {
-        "topic": extract_theme_category(key_topic_list[max_topic_idx]),
-        "similarity": topic_similarity,
-    }
     
     # 情感词匹配
     sentiment_matches = hybrid_sentiment_search(
@@ -254,10 +275,30 @@ def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_w
         reranker_model, reranker_tokenizer, bge_tokenizer, bge_model
     )
     
-    if sentiment_matches:
-        sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是："
-        sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
-        result_dict["prompt"] = sentiment_prompt
+    # 如果没有匹配到情感词，直接返回None
+    if not sentiment_matches:
+        return None
+    
+    # 主题匹配
+    sentence_embedding = get_cached_embeddings(sentence, bge_tokenizer, bge_model)
+    topic_similarity_scores = calculate_cosine_similarity(sentence_embedding, key_topic_embeddings)
+    max_topic_idx = torch.argmax(topic_similarity_scores).item()
+    topic_similarity = topic_similarity_scores[max_topic_idx].item()
+    
+    # 如果主题相似度低于阈值，返回None
+    if topic_similarity <= similarity_threshold:
+        return None
+    
+    # 构建结果字典
+    result_dict = {
+        "topic": extract_theme_category(key_topic_list[max_topic_idx]),
+        "similarity": topic_similarity,
+    }
+    
+    # 添加情感词匹配结果
+    sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是："
+    sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
+    result_dict["prompt"] = sentiment_prompt
     
     return result_dict
 
@@ -310,16 +351,12 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
                 if not sentences:
                     continue
                 
-                # 存储分隔后的句子
-                sentence_dict = {f"news_prompt{i+1}": sentence 
-                               for i, sentence in enumerate(sentences)}
-                df.at[index, 'NewsContent_cut'] = json.dumps(sentence_dict, ensure_ascii=False)
-                
-                # 存储每个句子的主题匹配和情感词匹配结果
+                # 存储有效的句子和处理结果
+                valid_sentences = {}
                 topic_match_dict = {}
                 
                 # 添加句子处理进度条
-                for sentence in tqdm(sentences, desc=f"处理第 {index} 行的句子", leave=False):
+                for i, sentence in enumerate(tqdm(sentences, desc=f"处理第 {index} 行的句子", leave=False)):
                     try:
                         result = process_single_sentence(
                             sentence, faiss_index, sentiment_prompts, original_words, 
@@ -328,12 +365,15 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
                             key_topic_list, similarity_threshold
                         )
                         if result:
+                            valid_sentences[f"news_prompt{i+1}"] = sentence
                             topic_match_dict[sentence] = result
                     except Exception as e:
                         print(f"处理句子失败 (3次重试后): {str(e)}")
                         continue
                 
-                if topic_match_dict:
+                # 只有当有有效结果时才更新DataFrame
+                if valid_sentences and topic_match_dict:
+                    df.at[index, 'NewsContent_cut'] = json.dumps(valid_sentences, ensure_ascii=False)
                     df.at[index, 'cut_news_topic_match'] = json.dumps(topic_match_dict, ensure_ascii=False)
                     print(f"第 {index} 行处理结果:", topic_match_dict)
                 
