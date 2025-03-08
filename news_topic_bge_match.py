@@ -18,7 +18,7 @@ import psutil
 
 def load_model(model_path):
     """
-    加载模型和分词器。
+    加载模型和分词器，使用FP16精度。
 
     参数:
     model_path (str): 模型的路径。
@@ -29,6 +29,9 @@ def load_model(model_path):
     """
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModel.from_pretrained(model_path)
+    
+    # 转换为FP16精度
+    model = model.half()  # 转换为FP16
     model.eval()
     return tokenizer, model
 
@@ -49,20 +52,15 @@ def get_embeddings(prompts, tokenizer, model):
     
     # Tokenize custom prompts
     encoded_input = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
-    # 将输入移到GPU
+    # 将输入移到GPU，但保持整数类型
     encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
 
-    # Compute token embeddings
     with torch.no_grad():
+        # 模型已经是half精度，会自动处理精度转换
         model_output = model(**encoded_input)
-        # Perform pooling. In this case, cls pooling.
         sentence_embeddings = model_output[0][:, 0]
-
-    # Normalize embeddings
-    sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
-    
-    # 移回CPU
-    sentence_embeddings = sentence_embeddings.cpu()
+        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        sentence_embeddings = sentence_embeddings.cpu().float()  # 转回FP32用于CPU操作
 
     return sentence_embeddings
 
@@ -152,10 +150,13 @@ def extract_theme_category(topic_text):
 
 def load_reranker(reranker_path):
     """
-    加载reranker模型
+    加载reranker模型，使用FP16精度
     """
     tokenizer = MSTokenizer.from_pretrained(reranker_path)
     model = AutoModelForSequenceClassification.from_pretrained(reranker_path)
+    
+    # 转换为FP16精度
+    model = model.half()  # 转换为FP16
     model.eval()
     return tokenizer, model
 
@@ -170,7 +171,7 @@ def compute_reranker_score(model, tokenizer, text1, text2):
 
 def hybrid_sentiment_search(sentence, faiss_index, sentiment_prompts, original_words, sentiment_scores,
                           reranker_model, reranker_tokenizer, bge_tokenizer, bge_model, 
-                          first_stage_threshold=0.4, top_k=10):
+                          first_stage_threshold=0.4, top_k=8):
     """
     两阶段搜索：FAISS快速筛选 + Reranker精确排序
     """
@@ -233,16 +234,15 @@ def batch_get_embeddings(texts, tokenizer, model, batch_size=32):
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
         encoded_input = tokenizer(batch_texts, padding=True, truncation=True, return_tensors='pt')
-        # 将输入移到GPU
+        # 将输入移到GPU，但保持整数类型
         encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
         
         with torch.no_grad():
             model_output = model(**encoded_input)
             sentence_embeddings = model_output[0][:, 0]
-            # 标准化
             sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
-            # 移回CPU
-            embeddings_list.append(sentence_embeddings.cpu())
+            sentence_embeddings = sentence_embeddings.cpu().float()  # 转回FP32用于CPU操作
+            embeddings_list.append(sentence_embeddings)
             
     return torch.cat(embeddings_list, dim=0)
 
@@ -325,7 +325,7 @@ def process_single_sentence(sentence, faiss_index, sentiment_prompts, original_w
     }
     
     # 添加情感词匹配结果
-    sentiment_prompt = f"新闻文本是“{sentence}”，包含的情绪词典是："
+    sentiment_prompt = f"新闻文本是##“{sentence}”##，包含的情绪词典是##："
     sentiment_prompt += ",".join([f"{m['word']}:{m['score']}" for m in sentiment_matches])
     result_dict["prompt"] = sentiment_prompt
     
@@ -368,7 +368,7 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
         # 处理新闻数据
         print("开始读取新闻数据...")
         df = pd.read_excel(news_file_path)
-        df = df.sample(100,random_state=42)
+        # df = df.sample(100,random_state=42)
         if df.empty:
             raise ValueError("新闻文件为空")
         print(f"共读取 {len(df)} 条新闻数据")
@@ -401,7 +401,7 @@ def process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path,
                         batch_results = []
                         
                         # 批量获取句子嵌入
-                        batch_embeddings = get_embeddings([f"新闻内容是"{s}"" for s in batch], 
+                        batch_embeddings = get_embeddings([f"新闻内容是“{s}”" for s in batch], 
                                                         bge_tokenizer, bge_model)
                         
                         for j, sentence in enumerate(batch):
@@ -571,10 +571,10 @@ if __name__ == "__main__":
     reranker_path = '/root/.cache/LLMS/hub/BAAI/bge-reranker-v2-m3'
     
     # 文件路径
-    news_file_path = './DATA/news_test_data.xlsx'
+    news_file_path = '/root/onethingai-fs/mydata/newspaper/sample_5000.xlsx'
     lda_key_words_path = './DATA/lda_key_words2.xlsx'
     sentiment_dict_path = './DATA/process_senti_dic_EN2.txt'
-    output_file_path = './output_result/news_data_with_topics_0225.xlsx'
+    output_file_path = './output_result/sft_train_data_0308.xlsx'
     
     # 调用主处理函数
     process_news_data(news_file_path, lda_key_words_path, sentiment_dict_path, 
