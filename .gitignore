@@ -1,0 +1,10 @@
+train_data/*
+pretrain_models/*
+benchmark/*
+best_sft_qwen_model/*
+sft_scripts/deepseek_sft_scripts/output.csv
+sft_scripts/deepseek_sft_scripts/ouutput2.csv
+sft_scripts/deepseek_sft_scripts/processed_data_batched.csv
+sft_scripts/deepseek_sft_scripts/processed_data_with_retries.csv
+source/lda_key_words_0509.xlsx
+source/process_senti_dic_EN2.txt
