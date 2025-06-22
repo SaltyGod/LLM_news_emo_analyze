@@ -1,7 +1,11 @@
 train_data/*
+!train_data/
 pretrain_models/*
+!pretrain_models/
 benchmark/*
+!benchmark/
 best_sft_qwen_model/*
+!best_sft_qwen_model/
 sft_scripts/deepseek_sft_scripts/output.csv
 sft_scripts/deepseek_sft_scripts/ouutput2.csv
 sft_scripts/deepseek_sft_scripts/processed_data_batched.csv
